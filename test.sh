@@ -6,6 +6,8 @@ set -eux
 HOST=http://localhost:8420
 SK=sk_test_12345
 
+curl -X DELETE $HOST/_config/data
+
 cus=$(curl -sSfg -u $SK: $HOST/v1/customers \
           -d email=james.robinson@example.com \
       | grep -oE 'cus_\w+' | head -n 1)
@@ -446,6 +448,10 @@ curl -sSfg -u $SK: $HOST/v1/invoices/upcoming?customer=$cus
 curl -sSfg -u $SK: $HOST/v1/invoices/upcoming?customer=$cus\&subscription_items[0][plan]=pro-annuel\&subscription_tax_percent=20
 
 curl -sSfg -u $SK: $HOST/v1/invoices/upcoming?customer=$cus\&subscription=$sub\&subscription_items[0][id]=si_RBrVStcKDimMnp\&subscription_items[0][plan]=basique-annuel\&subscription_proration_date=1504182686\&subscription_tax_percent=20
+
+si=$(curl -sSfg -u $SK: $HOST/v1/subscription_items?subscription=$sub \
+     | grep -oE 'si_\w+')
+[ -n "$si" ]
 
 curl -sSfg -u $SK: $HOST/v1/invoices/$in/lines
 
