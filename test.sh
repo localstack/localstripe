@@ -8,6 +8,8 @@ SK=sk_test_12345
 
 curl -X DELETE $HOST/_config/data
 
+timestamp=$(date +%s)
+
 cus=$(curl -sSfg -u $SK: $HOST/v1/customers \
           -d email=james.robinson@example.com \
       | grep -oE 'cus_\w+' | head -n 1)
@@ -450,8 +452,29 @@ curl -sSfg -u $SK: $HOST/v1/invoices/upcoming?customer=$cus\&subscription_items[
 curl -sSfg -u $SK: $HOST/v1/invoices/upcoming?customer=$cus\&subscription=$sub\&subscription_items[0][id]=si_RBrVStcKDimMnp\&subscription_items[0][plan]=basique-annuel\&subscription_proration_date=1504182686\&subscription_tax_percent=20
 
 si=$(curl -sSfg -u $SK: $HOST/v1/subscription_items?subscription=$sub \
-     | grep -oE 'si_\w+')
+     | grep -oE 'si_\w+' | head -n 1)
 [ -n "$si" ]
+
+# create usage records
+usage_record_id=$(
+  curl -sSfg -u $SK: $HOST/v1/subscription_items/$si/usage_records \
+       -d quantity=100 \
+       -d timestamp=$timestamp \
+  | grep -oE 'mbur_\w+')
+[ -n "$usage_record_id" ]
+
+usage_record_id=$(
+  curl -sSfg -u $SK: $HOST/v1/subscription_items/$si/usage_records \
+       -d quantity=15 \
+       -d timestamp=$timestamp \
+  | grep -oE 'mbur_\w+')
+[ -n "$usage_record_id" ]
+
+# get usage record summaries
+total_usage=$(
+  curl -sSfg -u $SK: $HOST/v1/subscription_items/$si/usage_record_summaries \
+  | grep -oP '"total_usage": \K([0-9]+)')
+[ "$total_usage" -eq 115 ]
 
 curl -sSfg -u $SK: $HOST/v1/invoices/$in/lines
 
