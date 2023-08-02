@@ -20,7 +20,16 @@ curl -sSfg -u $SK: $HOST/v1/customers/$cus \
 curl -sSfg -u $SK: $HOST/v1/customers/$cus \
      -d preferred_locales[]='fr-FR' -d preferred_locales[]='es-ES'
 
+cusB=$(curl -sSfg -u $SK: $HOST/v1/customers \
+            -d email=george.carlin@example.com \
+       | grep -oE 'cus_\w+' | head -n 1)
+
+email=$(curl -sSfg -u $SK: $HOST/v1/customers?email=james.robinson@example.com \
+        | grep -oE '"email": "james.robinson@example.com",')
+[ -n "$email" ]
+
 curl -sSfg -u $SK: -X DELETE $HOST/v1/customers/$cus
+curl -sSfg -u $SK: -X DELETE $HOST/v1/customers/$cusB
 
 cus=$(curl -sSfg -u $SK: $HOST/v1/customers \
            -d description='This customer is a company' \
@@ -32,8 +41,14 @@ cus=$(curl -sSfg -u $SK: $HOST/v1/customers \
       | grep -oE 'cus_\w+' | head -n 1)
 
 curl -sSfg -u $SK: $HOST/v1/customers/$cus/tax_ids \
-     -d type=eu_vat -d value=DE123456789 \
+     -d type=eu_vat \
+     -d value=DE123456789 \
      -d expand[]=customer
+
+tax_id=$(curl -sSfg -u $SK: $HOST/v1/customers/$cus/tax_ids \
+              -d type=eu_vat \
+              -d value=BE00111222333 \
+         | grep -oE 'txi_\w+' | head -n 1)
 
 curl -sSfg -u $SK: $HOST/v1/customers/$cus?expand[]=tax_ids.data.customer
 
@@ -42,6 +57,14 @@ curl -sSfg -u $SK: $HOST/v1/customers/$cus?expand[]=subscriptions.data.items.dat
 code=$(curl -sg -o /dev/null -w '%{http_code}' -u $SK: \
        $HOST/v1/customers/$cus?expand[]=subscriptions.data.items.data.tax_ids)
 [ "$code" -eq 400 ]
+
+curl -sSfg -u $SK: $HOST/v1/customers/$cus/tax_ids/$tax_id
+
+curl -sSfg -u $SK: -X DELETE $HOST/v1/customers/$cus/tax_ids/$tax_id
+
+code=$(curl -sg -o /dev/null -w '%{http_code}' -u $SK: \
+       $HOST/v1/customers/$cus/tax_ids/$tax_id)
+[ "$code" -eq 404 ]
 
 txr1=$(curl -sSfg -u $SK: $HOST/v1/tax_rates \
             -d display_name=VAT \
@@ -434,7 +457,7 @@ code=$(curl -sg -o /dev/null -w "%{http_code}" -u $SK: \
 curl -sSfg -u $SK: $HOST/v1/subscriptions \
      -d customer=$cus \
      -d items[0][plan]=basique-mensuel \
-     -d expand[]=latest_invoice.payment_intent
+     -d expand[]=latest_invoice.payment_intent.latest_charge
 
 res=$(curl -sSfg -u $SK: $HOST/v1/subscriptions \
            -d customer=$cus \
@@ -812,17 +835,17 @@ status=$(
 
 # list charges
 total_count=$(
-  curl -sSfg -u $SK: $HOST/v1/charges | grep -oE '"total_count": 15')
+  curl -sSfg -u $SK: $HOST/v1/charges | grep -oE '"total_count": 15,')
 [ -n "$total_count" ]
 
 total_count=$(
   curl -sSfg -u $SK: $HOST/v1/charges?customer=$cus \
-  | grep -oE '"total_count": 6')
+  | grep -oE '"total_count": 6,')
 [ -n "$total_count" ]
 
 total_count=$(
   curl -sSfg -u $SK: $HOST/v1/charges?customer=$cus\&created[gt]=1588166306 \
-  | grep -oE '"total_count": 6')
+  | grep -oE '"total_count": 6,')
 [ -n "$total_count" ]
 
 no_more_events=$(curl -sSfg -u $SK: $HOST/v1/events \
@@ -943,7 +966,7 @@ card=$(curl -sSfg -u $SK: $HOST/v1/payment_methods?customer=$cus\&type=card \
 
 # trying to create a customer with a non-existant payment_method returns a 404, and doesn't create customer
 total_count=$( curl -sSfg -u $SK: $HOST/v1/customers \
-             | grep -oE '"total_count": 9')
+             | grep -oE '"total_count": 9,')
 [ -n "$total_count" ]
 
 code=$(curl -sg -o /dev/null -w '%{http_code}' -u $SK: $HOST/v1/customers \
@@ -952,5 +975,22 @@ code=$(curl -sg -o /dev/null -w '%{http_code}' -u $SK: $HOST/v1/customers \
 [ "$code" -eq 404 ]
 
 total_count=$( curl -sSfg -u $SK: $HOST/v1/customers \
-             | grep -oE '"total_count": 9')
+             | grep -oE '"total_count": 9,')
 [ -n "$total_count" ]
+
+cus=$(curl -sSfg -u $SK: $HOST/v1/customers \
+           -d balance='-20000000' \
+      | grep -oE 'cus_\w+' | head -n 1)
+
+amount=$(curl -sSfg -u $SK: $HOST/v1/subscriptions \
+              -d customer=$cus \
+              -d items[0][plan]=basique-mensuel \
+              -d expand[]=latest_invoice \
+         | grep -oP 'amount_due": \K([0-9]+)')
+[ "$amount" -eq 0 ]
+
+charge=$(curl -sSfgG -u $SK: $HOST/v1/invoices \
+              -d customer=$cus \
+              -d expand[]=data.charge.refunds \
+         | grep -oE '"charge": null,')
+[ -n "$charge" ]

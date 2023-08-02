@@ -238,8 +238,7 @@ def api_update(cls, url):
 def api_delete(cls, url):
     def f(request):
         id = request.match_info['id']
-        ret = cls._api_delete(id)
-        return json_response(ret if isinstance(ret, dict) else ret._export())
+        return json_response(cls._api_delete(id)._export())
     return f
 
 
@@ -265,6 +264,8 @@ def api_extra(func, url):
         if 'subscription_item_id' in request.match_info:
             data['subscription_item_id'] = \
                     request.match_info['subscription_item_id']
+        if 'tax_id' in request.match_info:
+            data['tax_id'] = request.match_info['tax_id']
         expand = data.pop('expand', None)
         return json_response(func(**data)._export(expand=expand))
     return f

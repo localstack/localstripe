@@ -158,7 +158,7 @@ class StripeObject(object):
         if key not in store.keys():
             raise UserError(404, 'Not Found')
         del store[key]
-        return {'deleted': True, 'id': id}
+        return DeletedObject(id, cls.object)
 
     @classmethod
     def _api_list_all(cls, url, limit=None, starting_after=None, **kwargs):
@@ -233,7 +233,7 @@ class StripeObject(object):
                     id = obj[k]
                     cls = StripeObject._get_class_for_id(id)
                     obj[k] = cls._api_retrieve(id)._export()
-                if path is not None:
+                if path is not None and obj[k] is not None:
                     do_expand(path, obj[k])
         try:
             for path in expand:
@@ -242,6 +242,14 @@ class StripeObject(object):
             raise UserError(400, 'Bad expand %s' % e)
 
         return obj
+
+
+class DeletedObject(StripeObject):
+    deleted = True
+
+    def __init__(self, id, object):
+        self.id = id
+        self.object = object
 
 
 class Balance(object):
@@ -710,10 +718,11 @@ class Customer(StripeObject):
                  phone=None, address=None,
                  invoice_settings=None, business_vat_id=None,
                  preferred_locales=None, tax_id_data=None,
-                 metadata=None, payment_method=None, **kwargs):
+                 metadata=None, payment_method=None, balance=0, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
+        balance = try_convert_to_int(balance)
         try:
             if name is not None:
                 assert type(name) is str
@@ -753,6 +762,7 @@ class Customer(StripeObject):
                 assert type(data['value']) is str and len(data['value']) > 10
             if payment_method is not None:
                 assert type(payment_method) is str
+            assert type(balance) is int
         except AssertionError:
             raise UserError(400, 'Bad request')
 
@@ -772,7 +782,7 @@ class Customer(StripeObject):
         self.business_vat_id = business_vat_id
         self.preferred_locales = preferred_locales
         self.metadata = metadata or {}
-        self.account_balance = 0
+        self.account_balance = - balance
         self.delinquent = False
         self.discount = None
         self.shipping = None
@@ -938,6 +948,29 @@ class Customer(StripeObject):
         return obj.tax_ids
 
     @classmethod
+    def _api_retrieve_tax_id(cls, id, tax_id, **kwargs):
+        if kwargs:
+            raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
+
+        obj = cls._api_retrieve(id)
+        for txi in obj.tax_ids._list:
+            if txi.id == tax_id:
+                return txi
+        raise UserError(404, 'Customer ' + id + ' does not have a tax ID with '
+                             'ID ' + tax_id)
+
+    @classmethod
+    def _api_delete_tax_id(cls, id, tax_id, **kwargs):
+        if kwargs:
+            raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
+
+        obj = cls._api_retrieve(id)
+        tax_id_obj = cls._api_retrieve_tax_id(id, tax_id)
+        obj.tax_ids._list.remove(tax_id_obj)
+
+        return DeletedObject(tax_id_obj.id, tax_id_obj.object)
+
+    @classmethod
     def _api_list_subscriptions(cls, id, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
@@ -960,6 +993,25 @@ class Customer(StripeObject):
 
         if object is not None:
             li._list = [i for i in li._list if i.object == object]
+
+        return li
+
+    @classmethod
+    def _api_list_all(cls, url, email=None, limit=None, starting_after=None,
+                      **kwargs):
+        if kwargs:
+            raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
+
+        try:
+            if email is not None:
+                assert type(email) is str
+        except AssertionError:
+            raise UserError(400, 'Bad request')
+
+        li = super(Customer, cls)._api_list_all(url, limit=limit,
+                                                starting_after=starting_after)
+        if email is not None:
+            li._list = [i for i in li._list if i.email == email]
 
         return li
 
@@ -1013,8 +1065,12 @@ extra_apis.extend((
      Customer._api_update_subscription),
     # This is the old API route:
     ('POST', '/v1/customers/{id}/cards', Customer._api_add_source),
+    ('GET', '/v1/customers/{id}/tax_ids', Customer._api_list_tax_ids),
+    ('GET', '/v1/customers/{id}/tax_ids/{tax_id}',
+     Customer._api_retrieve_tax_id),
     ('POST', '/v1/customers/{id}/tax_ids', Customer._api_add_tax_id),
-    ('GET', '/v1/customers/{id}/tax_ids', Customer._api_list_tax_ids)))
+    ('DELETE', '/v1/customers/{id}/tax_ids/{tax_id}',
+     Customer._api_delete_tax_id)))
 
 
 class Event(StripeObject):
@@ -1080,7 +1136,7 @@ class Invoice(StripeObject):
         except AssertionError:
             raise UserError(400, 'Bad request')
 
-        Customer._api_retrieve(customer)  # to return 404 if not existant
+        cus = Customer._api_retrieve(customer)
 
         if subscription is not None:
             subscription_obj = Subscription._api_retrieve(subscription)
@@ -1103,11 +1159,11 @@ class Invoice(StripeObject):
         self.attempt_count = 1
         self.attempted = True
         self.billing_reason = None
+        self.collection_method = 'charge_automatically'
         self.description = description
         self.discount = None
-        self.ending_balance = 0
         self.receipt_number = None
-        self.starting_balance = 0
+        self.starting_balance = cus.account_balance
         self.statement_descriptor = None
         self.webhooks_delivered_at = self.date
         self.status_transitions = {
@@ -1143,6 +1199,9 @@ class Invoice(StripeObject):
         self._draft = True
         self._voided = False
 
+        self.ending_balance = \
+            max(0, cus.account_balance - self.subtotal - self.tax)
+
         if not simulation and not upcoming:
             if subscription is not None:
                 subscription_obj.latest_invoice = self.id
@@ -1176,7 +1235,7 @@ class Invoice(StripeObject):
 
     @property
     def total(self):
-        return self.subtotal + self.tax
+        return max(0, self.subtotal + self.tax - self.starting_balance)
 
     @property
     def amount_due(self):
@@ -1211,8 +1270,7 @@ class Invoice(StripeObject):
     def charge(self):
         if self.payment_intent:
             pi = PaymentIntent._api_retrieve(self.payment_intent)
-            if len(pi.charges._list):
-                return pi.charges._list[-1]
+            return pi.latest_charge
 
     def _finalize(self):
         assert self.status == 'draft'
@@ -1263,7 +1321,8 @@ class Invoice(StripeObject):
                           subscription_proration_date=None,
                           subscription_tax_percent=None,  # deprecated
                           subscription_default_tax_rates=None,
-                          subscription_trial_end=None):
+                          subscription_trial_end=None,
+                          pending_invoice_items_behavior=None):
         subscription_proration_date = \
             try_convert_to_int(subscription_proration_date)
         try:
@@ -1417,11 +1476,13 @@ class Invoice(StripeObject):
 
     @classmethod
     def _api_create(cls, customer=None, subscription=None, tax_percent=None,
-                    default_tax_rates=None, description=None, metadata=None):
+                    default_tax_rates=None, description=None, metadata=None,
+                    pending_invoice_items_behavior=None):
         return cls._get_next_invoice(
             customer=customer, subscription=subscription,
             tax_percent=tax_percent, default_tax_rates=default_tax_rates,
-            description=description, metadata=metadata)
+            description=description, metadata=metadata,
+            pending_invoice_items_behavior=pending_invoice_items_behavior)
 
     @classmethod
     def _api_delete(cls, id):
@@ -1780,7 +1841,7 @@ class PaymentIntent(StripeObject):
 
         self.amount = amount
         self.currency = currency
-        self.charges = List('/v1/charges?payment_intent=' + self.id)
+        self.latest_charge = None
         self.client_secret = self.id + '_secret_' + random_id(16)
         self.customer = customer
         self.payment_method = payment_method
@@ -1814,7 +1875,7 @@ class PaymentIntent(StripeObject):
                         currency=self.currency,
                         customer=self.customer,
                         source=self.payment_method)
-        self.charges._list.append(charge)
+        self.latest_charge = charge
         charge._trigger_payment(on_success, on_failure_now, on_failure_later)
 
     @property
@@ -1825,15 +1886,21 @@ class PaymentIntent(StripeObject):
             return 'requires_payment_method'
         if self.next_action:
             return 'requires_action'
-        if len(self.charges._list) == 0:
+        if self.latest_charge is None:
             return 'requires_confirmation'
-        charge = self.charges._list[-1]
-        if charge.status == 'succeeded':
+        if self.latest_charge.status == 'succeeded':
             return 'succeeded'
-        elif charge.status == 'failed':
+        elif self.latest_charge.status == 'failed':
             return 'requires_payment_method'
-        elif charge.status == 'pending':
+        elif self.latest_charge.status == 'pending':
             return 'processing'
+
+    @property
+    def charges(self):  # deprecated
+        charges = List('/v1/charges?payment_intent=' + self.id)
+        if self.latest_charge is not None:
+            charges._list = [self.latest_charge]
+        return charges
 
     @property
     def last_payment_error(self):
@@ -1843,13 +1910,12 @@ class PaymentIntent(StripeObject):
                 'message': (
                     'The provided PaymentMethod has failed authentication.'),
             }
-        if len(self.charges._list):
-            charge = self.charges._list[-1]
-            if charge.status == 'failed':
+        if self.latest_charge:
+            if self.latest_charge.status == 'failed':
                 return {
-                    'charge': charge.id,
-                    'code': charge.failure_code,
-                    'message': charge.failure_message,
+                    'charge': self.latest_charge.id,
+                    'code': self.latest_charge.failure_code,
+                    'message': self.latest_charge.failure_message,
                 }
 
     @classmethod
