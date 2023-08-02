@@ -20,11 +20,11 @@ from localstripe import __author__, __version__
 
 
 setup(
-    name='localstripe',
+    name='localstack-localstripe',
     version=__version__,
     author=__author__,
     url='https://github.com/adrienverge/localstripe',
-    description=('A fake but stateful Stripe server that you can run locally, '
+    description=('LocalStack\'s fork of localstripe, a fake but stateful Stripe server that you can run locally, '
                  'for testing purposes.'),
 
     packages=['localstripe'],
