@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2017 Adrien Vergé
 #
 # This program is free software: you can redistribute it and/or modify
@@ -82,7 +81,7 @@ def try_convert_to_bool(arg):
 
 
 def try_convert_to_int(arg):
-    if type(arg) == int:
+    if type(arg) is int:
         return arg
     elif type(arg) in (str, float):
         try:
@@ -93,7 +92,7 @@ def try_convert_to_int(arg):
 
 
 def try_convert_to_float(arg):
-    if type(arg) == float:
+    if type(arg) is float:
         return arg
     elif type(arg) in (str, int):
         try:
@@ -277,10 +276,10 @@ class Balance(object):
         schedule_webhook(Event('balance.available', self))
 
     @classmethod
-    def _api_retrieve(self):
-        obj = store.get(self.object)
+    def _api_retrieve(cls):
+        obj = store.get(cls.object)
         if obj is None:
-            return self()
+            return cls()
         return obj
 
     def _export(self, expand=None):
@@ -507,6 +506,7 @@ class Charge(StripeObject):
         self.status = 'pending'
         self.receipt_email = None
         self.receipt_number = None
+        self.payment_intent = None
         self.payment_method = source.id
         self.statement_descriptor = statement_descriptor
         self.failure_code = None
@@ -514,41 +514,14 @@ class Charge(StripeObject):
         self.captured = capture
         self.balance_transaction = None
 
-    def _trigger_payment(self, on_success=None, on_failure_now=None,
-                         on_failure_later=None):
+    def _is_async_payment_method(self):
         pm = PaymentMethod._api_retrieve(self.payment_method)
-        async_payment = pm.type == 'sepa_debit'
+        return pm.type == 'sepa_debit'
 
-        if async_payment:
-            if not self._authorized:
-                async def callback():
-                    await asyncio.sleep(0.5)
-                    self.status = 'failed'
-                    if on_failure_later:
-                        on_failure_later()
-            else:
-                async def callback():
-                    await asyncio.sleep(0.5)
-                    txn = BalanceTransaction(amount=self.amount,
-                                             currency=self.currency,
-                                             description=self.description,
-                                             exchange_rate=1.0,
-                                             reporting_category='charge',
-                                             source=self.id, type='charge')
-                    self.balance_transaction = txn.id
-                    self.status = 'succeeded'
-                    if on_success:
-                        on_success()
-            asyncio.ensure_future(callback())
-
-        else:
-            if not self._authorized:
-                self.status = 'failed'
-                self.failure_code = 'card_declined'
-                self.failure_message = 'Your card was declined.'
-                if on_failure_now:
-                    on_failure_now()
-            else:
+    def _trigger_payment(self, on_success=None):
+        if self._is_async_payment_method():
+            async def callback():
+                await asyncio.sleep(0.5)
                 txn = BalanceTransaction(amount=self.amount,
                                          currency=self.currency,
                                          description=self.description,
@@ -559,25 +532,58 @@ class Charge(StripeObject):
                 self.status = 'succeeded'
                 if on_success:
                     on_success()
+            asyncio.ensure_future(callback())
+
+        else:
+            txn = BalanceTransaction(amount=self.amount,
+                                     currency=self.currency,
+                                     description=self.description,
+                                     exchange_rate=1.0,
+                                     reporting_category='charge',
+                                     source=self.id, type='charge')
+            self.balance_transaction = txn.id
+            self.status = 'succeeded'
+            if on_success:
+                on_success()
 
     @classmethod
     def _api_create(cls, **data):
         obj = super()._api_create(**data)
 
-        # for successful pre-auth, return unpaid charge
-        if not obj.captured and obj._authorized:
-            return obj
-
-        def on_failure():
-            raise UserError(402, 'Your card was declined.',
-                            {'code': 'card_declined', 'charge': obj.id})
-
-        obj._trigger_payment(
-            on_failure_now=on_failure,
-            on_failure_later=on_failure
-        )
+        obj._initialize_charge(on_failure_now=obj._raise_failure)
 
         return obj
+
+    def _set_auth_failure(self):
+        self.status = 'failed'
+        self.failure_code = 'card_declined'
+        self.failure_message = 'Your card was declined.'
+
+    def _raise_failure(self):
+        raise UserError(402, self.failure_message,
+                        {'code': self.failure_code, 'charge': self.id})
+
+    def _initialize_charge(self, on_success=None, on_failure_now=None,
+                           on_failure_later=None):
+        if not self._authorized:
+            if self._is_async_payment_method():
+                async def callback():
+                    await asyncio.sleep(0.5)
+                    self._set_auth_failure()
+                    if on_failure_later:
+                        on_failure_later()
+                asyncio.ensure_future(callback())
+            else:
+                self._set_auth_failure()
+                if on_failure_now:
+                    on_failure_now()
+
+            return
+
+        self.status = 'succeeded'
+
+        if self.captured:
+            self._trigger_payment(on_success)
 
     @classmethod
     def _api_capture(cls, id, amount=None, **kwargs):
@@ -590,25 +596,29 @@ class Charge(StripeObject):
             raise UserError(400, 'Bad request')
 
         obj = cls._api_retrieve(id)
+        obj._capture(amount)
+        return obj
 
+    def _capture(self, amount, on_success=None):
         if amount is None:
-            amount = obj.amount
+            amount = self.amount
 
         amount = try_convert_to_int(amount)
         try:
-            assert type(amount) is int and 0 <= amount <= obj.amount
-            assert obj.captured is False
+            assert type(amount) is int and 0 <= amount <= self.amount
+            assert self.captured is False and self.status == 'succeeded'
         except AssertionError:
             raise UserError(400, 'Bad request')
 
-        def on_success():
-            obj.captured = True
-            if amount < obj.amount:
-                refunded = obj.amount - amount
-                Refund(obj.id, refunded)
+        def on_success_capture():
+            self.captured = True
+            if amount < self.amount:
+                refunded = self.amount - amount
+                Refund(charge=self.id, amount=refunded)
+            if on_success:
+                on_success()
 
-        obj._trigger_payment(on_success)
-        return obj
+        self._trigger_payment(on_success=on_success_capture)
 
     @property
     def paid(self):
@@ -758,8 +768,12 @@ class Customer(StripeObject):
             for data in tax_id_data:
                 assert type(data) is dict
                 assert set(data.keys()) == {'type', 'value'}
-                assert data['type'] in ('eu_vat', 'nz_gst', 'au_abn')
-                assert type(data['value']) is str and len(data['value']) > 10
+                assert data['type'] in ('eu_vat', 'nz_gst', 'au_abn', 'es_cif')
+                assert type(data['value']) is str
+                if data['type'] == 'es_cif':
+                    assert len(data['value']) == 9
+                else:
+                    assert len(data['value']) > 10
             if payment_method is not None:
                 assert type(payment_method) is str
             assert type(balance) is int
@@ -927,8 +941,12 @@ class Customer(StripeObject):
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
         try:
-            assert type in ('eu_vat', 'nz_gst', 'au_abn')
-            assert _type(value) is str and len(value) > 10
+            assert type in ('eu_vat', 'nz_gst', 'au_abn', 'es_cif')
+            assert _type(value) is str
+            if type == 'es_cif':
+                assert len(value) == 9
+            else:
+                assert len(value) > 10
         except AssertionError:
             raise UserError(400, 'Bad request')
 
@@ -1096,6 +1114,47 @@ class Event(StripeObject):
     @classmethod
     def _api_delete(cls, id):
         raise UserError(405, 'Method Not Allowed')
+
+    @classmethod
+    def _api_list_all(cls, url, type=None, created=None, limit=None,
+                      starting_after=None, **kwargs):
+        if kwargs:
+            raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
+
+        filters = []
+        try:
+            if type is not None:
+                assert _type(type) is str
+                filters.append(lambda obj: obj.type == type)
+            if created is not None:
+                assert _type(created) is dict
+                gt = try_convert_to_int(created.pop('gt', None))
+                if gt is not None:
+                    filters.append(lambda obj: obj.created > gt)
+
+                gte = try_convert_to_int(created.pop('gte', None))
+                if gte is not None:
+                    filters.append(lambda obj: obj.created >= gte)
+
+                lt = try_convert_to_int(created.pop('lt', None))
+                if lt is not None:
+                    filters.append(lambda obj: obj.created < lt)
+
+                lte = try_convert_to_int(created.pop('lte', None))
+                if lte is not None:
+                    filters.append(lambda obj: obj.created <= lte)
+
+                assert not created  # no other params are supported
+        except AssertionError:
+            raise UserError(400, 'Bad request')
+
+        li = super()._api_list_all(
+            url, limit=limit, starting_after=starting_after
+        )
+
+        li._list = [obj for obj in li._list if all(f(obj) for f in filters)]
+
+        return li
 
 
 class Invoice(StripeObject):
@@ -1564,7 +1623,7 @@ class Invoice(StripeObject):
                                payment_method=pm.id)
             obj.payment_intent = pi.id
             pi.invoice = obj.id
-            PaymentIntent._api_confirm(obj.payment_intent)
+            pi._confirm(on_failure_now=lambda: None)
 
         return obj
 
@@ -1811,7 +1870,8 @@ class PaymentIntent(StripeObject):
     _id_prefix = 'pi_'
 
     def __init__(self, amount=None, currency=None, customer=None,
-                 payment_method=None, metadata=None, **kwargs):
+                 payment_method=None, metadata=None, payment_method_types=None,
+                 capture_method=None, payment_method_options=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
@@ -1827,6 +1887,10 @@ class PaymentIntent(StripeObject):
                 assert (payment_method.startswith('pm_') or
                         payment_method.startswith('src_') or
                         payment_method.startswith('card_'))
+            if capture_method is not None:
+                assert capture_method in ('automatic',
+                                          'automatic_async',
+                                          'manual')
         except AssertionError:
             raise UserError(400, 'Bad request')
 
@@ -1848,35 +1912,44 @@ class PaymentIntent(StripeObject):
         self.metadata = metadata or {}
         self.invoice = None
         self.next_action = None
+        self.capture_method = capture_method or 'automatic_async'
 
         self._canceled = False
         self._authentication_failed = False
 
-    def _trigger_payment(self):
+    def _on_success(self):
+        schedule_webhook(Event('payment_intent.succeeded', self))
+        if self.invoice:
+            invoice = Invoice._api_retrieve(self.invoice)
+            invoice._on_payment_success()
+
+    def _report_failure(self):
+        schedule_webhook(Event('payment_intent.payment_failed', self))
+        if self.invoice:
+            invoice = Invoice._api_retrieve(self.invoice)
+            invoice._on_payment_failure_now()
+
+        self.latest_charge._raise_failure()
+
+    def _report_async_failure(self):
+        schedule_webhook(Event('payment_intent.payment_failed', self))
+        if self.invoice:
+            invoice = Invoice._api_retrieve(self.invoice)
+            invoice._on_payment_failure_later()
+
+    def _create_charge(self, on_failure_now):
         if self.status != 'requires_confirmation':
             raise UserError(400, 'Bad request')
-
-        def on_success():
-            if self.invoice:
-                invoice = Invoice._api_retrieve(self.invoice)
-                invoice._on_payment_success()
-
-        def on_failure_now():
-            if self.invoice:
-                invoice = Invoice._api_retrieve(self.invoice)
-                invoice._on_payment_failure_now()
-
-        def on_failure_later():
-            if self.invoice:
-                invoice = Invoice._api_retrieve(self.invoice)
-                invoice._on_payment_failure_later()
 
         charge = Charge(amount=self.amount,
                         currency=self.currency,
                         customer=self.customer,
-                        source=self.payment_method)
+                        source=self.payment_method,
+                        capture=(self.capture_method != "manual"))
+        charge.payment_intent = self.id
         self.latest_charge = charge
-        charge._trigger_payment(on_success, on_failure_now, on_failure_later)
+        charge._initialize_charge(self._on_success, on_failure_now,
+                                  self._report_async_failure)
 
     @property
     def status(self):
@@ -1888,6 +1961,9 @@ class PaymentIntent(StripeObject):
             return 'requires_action'
         if self.latest_charge is None:
             return 'requires_confirmation'
+        if (self.latest_charge.status == 'succeeded' and
+                not self.latest_charge.captured):
+            return 'requires_capture'
         if self.latest_charge.status == 'succeeded':
             return 'succeeded'
         elif self.latest_charge.status == 'failed':
@@ -1934,7 +2010,7 @@ class PaymentIntent(StripeObject):
         obj = super()._api_create(**data)
 
         if confirm:
-            cls._api_confirm(obj.id)
+            obj._confirm(on_failure_now=obj._report_failure)
 
         return obj
 
@@ -1956,18 +2032,21 @@ class PaymentIntent(StripeObject):
         if obj.status != 'requires_confirmation':
             raise UserError(400, 'Bad request')
 
-        obj._authentication_failed = False
-        payment_method = PaymentMethod._api_retrieve(obj.payment_method)
+        obj._confirm(on_failure_now=obj._report_failure)
+
+        return obj
+
+    def _confirm(self, on_failure_now):
+        self._authentication_failed = False
+        payment_method = PaymentMethod._api_retrieve(self.payment_method)
         if payment_method._requires_authentication():
-            obj.next_action = {
+            self.next_action = {
                 'type': 'use_stripe_sdk',
                 'use_stripe_sdk': {'type': 'three_d_secure_redirect',
                                    'stripe_js': ''},
             }
         else:
-            obj._trigger_payment()
-
-        return obj
+            self._create_charge(on_failure_now=on_failure_now)
 
     @classmethod
     def _api_cancel(cls, id, **kwargs):
@@ -2011,7 +2090,7 @@ class PaymentIntent(StripeObject):
 
         obj.next_action = None
         if success:
-            obj._trigger_payment()
+            obj._create_charge(on_failure_now=obj._report_failure)
         else:
             obj._authentication_failed = True
             obj.payment_method = None
@@ -2021,10 +2100,26 @@ class PaymentIntent(StripeObject):
 
         return obj
 
+    @classmethod
+    def _api_capture(cls, id, amount_to_capture=None, **kwargs):
+        if kwargs:
+            raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
+
+        try:
+            assert type(id) is str and id.startswith('pi_')
+        except AssertionError:
+            raise UserError(400, 'Bad request')
+
+        obj = cls._api_retrieve(id)
+        obj.latest_charge._capture(amount=amount_to_capture,
+                                   on_success=obj._on_success)
+        return obj
+
 
 extra_apis.extend((
     ('POST', '/v1/payment_intents/{id}/confirm', PaymentIntent._api_confirm),
     ('POST', '/v1/payment_intents/{id}/cancel', PaymentIntent._api_cancel),
+    ('POST', '/v1/payment_intents/{id}/capture', PaymentIntent._api_capture),
     ('POST', '/v1/payment_intents/{id}/_authenticate',
      PaymentIntent._api_authenticate)))
 
@@ -2169,6 +2264,10 @@ class PaymentMethod(StripeObject):
 
     @classmethod
     def _api_retrieve(cls, id):
+        obj = cls._try_get_canonical_test_article(id)
+        if obj:
+            return obj
+
         # https://stripe.com/docs/payments/payment-methods#transitioning
         # You can retrieve all saved compatible payment instruments through the
         # Payment Methods API.
@@ -2178,6 +2277,41 @@ class PaymentMethod(StripeObject):
             return Source._api_retrieve(id)
 
         return super()._api_retrieve(id)
+
+    @classmethod
+    def _try_get_canonical_test_article(cls, id):
+        """Convert special payment method IDs into payment method objects.
+
+        See https://docs.stripe.com/testing?testing-method=payment-methods.
+
+        Oddly, as we do here, Stripe will convert these special test IDs into
+        actual objects and store them on a GET request, meaning the GET has
+        side effects and is not idempotent."""
+
+        if id == 'pm_card_visa':
+            return PaymentMethod(
+                type='card',
+                card=dict(
+                    number='4242424242424242',
+                    exp_month='12',
+                    exp_year='2030',
+                    cvc='123'))
+        if id == 'pm_card_visa_chargeDeclined':
+            return PaymentMethod(
+                type='card',
+                card=dict(
+                    number='4000000000000002',
+                    exp_month='12',
+                    exp_year='2030',
+                    cvc='123'))
+        if id == 'pm_card_chargeCustomerFail':
+            return PaymentMethod(
+                type='card',
+                card=dict(
+                    number='4000000000000341',
+                    exp_month='12',
+                    exp_year='2030',
+                    cvc='123'))
 
     @classmethod
     def _api_list_all(cls, url, customer=None, type=None, limit=None,
@@ -2489,24 +2623,42 @@ class Refund(StripeObject):
     object = 'refund'
     _id_prefix = 're_'
 
-    def __init__(self, charge=None, amount=None, metadata=None, **kwargs):
+    def __init__(self, charge=None, payment_intent=None, amount=None,
+                 metadata=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
         amount = try_convert_to_int(amount)
         try:
-            assert type(charge) is str and charge.startswith('ch_')
+            if charge is not None:
+                assert type(charge) is str and charge.startswith('ch_')
+                assert payment_intent is None
+            elif payment_intent is not None:
+                assert (type(payment_intent) is str and
+                        payment_intent.startswith('pi_'))
+            else:
+                raise UserError(400, 'Expected charge or payment_intent')
             if amount is not None:
                 assert type(amount) is int and amount > 0
         except AssertionError:
             raise UserError(400, 'Bad request')
 
+        if payment_intent is not None:
+            payment_intent_obj = PaymentIntent._api_retrieve(payment_intent)
+            if payment_intent_obj.status == 'requires_payment_method':
+                raise UserError(400, 'Cannot refund a failed payment.')
+
+            charge = payment_intent_obj.latest_charge.id
+
         charge_obj = Charge._api_retrieve(charge)
+        if charge_obj.status == 'failed':
+            raise UserError(400, 'Cannot refund a failed payment.')
 
         # All exceptions must be raised before this point.
         super().__init__()
 
         self.charge = charge
+        self.payment_intent = payment_intent
         self.metadata = metadata or {}
         self.amount = amount
         self.date = self.created
@@ -2526,10 +2678,18 @@ class Refund(StripeObject):
             self.balance_transaction = txn.id
 
     @classmethod
-    def _api_list_all(cls, url, charge=None, limit=None, starting_after=None):
+    def _api_list_all(cls, url, charge=None, payment_intent=None, limit=None,
+                      starting_after=None):
         try:
             if charge is not None:
                 assert type(charge) is str and charge.startswith('ch_')
+                assert payment_intent is None
+            elif payment_intent is not None:
+                assert (type(payment_intent) is str and
+                        payment_intent.startswith('pi_'))
+                payment_intent_obj = PaymentIntent._api_retrieve(
+                    payment_intent)
+                charge = payment_intent_obj.latest_charge.id
         except AssertionError:
             raise UserError(400, 'Bad request')
 
@@ -2646,7 +2806,7 @@ class SetupIntent(StripeObject):
 
     @classmethod
     def _api_confirm(cls, id, use_stripe_sdk=None, client_secret=None,
-                     payment_method_data=None, **kwargs):
+                     payment_method=None, payment_method_data=None, **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
@@ -2664,34 +2824,41 @@ class SetupIntent(StripeObject):
         if client_secret and client_secret != obj.client_secret:
             raise UserError(401, 'Unauthorized')
 
-        if payment_method_data:
-            if obj.payment_method is not None:
-                raise UserError(400, 'Bad request')
-
+        if payment_method is not None:
+            assert isinstance(payment_method, str)
+            pm = PaymentMethod._api_retrieve(payment_method)
+            obj._attach_pm(pm)
+        elif payment_method_data is not None:
             pm = PaymentMethod(**payment_method_data)
-            obj.payment_method = pm.id
-
-            if pm._attaching_is_declined():
-                obj.status = 'canceled'
-                obj.next_action = None
-                raise UserError(402, 'Your card was declined.',
-                                {'code': 'card_declined'})
-            elif pm._requires_authentication():
-                obj.status = 'requires_action'
-                obj.next_action = {'type': 'use_stripe_sdk',
-                                   'use_stripe_sdk': {
-                                       'type': 'three_d_secure_redirect',
-                                       'stripe_js': ''}}
-            else:
-                obj.status = 'succeeded'
-                obj.next_action = None
+            obj._attach_pm(pm)
         elif obj.payment_method is None:
-            obj.status = 'requires_payment_method'
-            obj.next_action = None
+            # If no payment method was specified upon SetupIntent creation, and
+            # none was specified in the confirm request, there's nothing to
+            # confirm. Stripe returns a 400 error in this case:
+            raise UserError(400, 'Bad request')
         else:
             obj.status = 'succeeded'
             obj.next_action = None
+
         return obj
+
+    def _attach_pm(self, pm):
+        self.payment_method = pm.id
+
+        if pm._attaching_is_declined():
+            self.status = 'canceled'
+            self.next_action = None
+            raise UserError(402, 'Your card was declined.',
+                            {'code': 'card_declined'})
+        elif pm._requires_authentication():
+            self.status = 'requires_action'
+            self.next_action = {'type': 'use_stripe_sdk',
+                                'use_stripe_sdk': {
+                                    'type': 'three_d_secure_redirect',
+                                    'stripe_js': ''}}
+        else:
+            self.status = 'succeeded'
+            self.next_action = None
 
     @classmethod
     def _api_cancel(cls, id, use_stripe_sdk=None, client_secret=None,
@@ -3242,10 +3409,20 @@ class TaxId(StripeObject):
         try:
             assert _type(customer) is str
             assert customer.startswith('cus_')
-            assert type in ('eu_vat', 'nz_gst', 'au_abn')
-            assert _type(value) is str and len(value) > 10
+            assert type in ('eu_vat', 'nz_gst', 'au_abn', 'es_cif')
+            assert _type(value) is str
+            if type == 'es_cif':
+                assert len(value) == 9
+            else:
+                assert len(value) > 10
             if country is None:
-                country = value[0:2]
+                if type == 'eu_vat':
+                    country = value[0:2]
+                elif type in ('nz_gst', 'au_abn', 'es_cif'):
+                    country = type[0:2].upper()
+                else:
+                    # shouldn't happen because type is checked above
+                    assert False
             assert _type(country) is str
         except AssertionError:
             raise UserError(400, 'Bad request')

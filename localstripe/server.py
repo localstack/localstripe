@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2017 Adrien Vergé
 #
 # This program is free software: you can redistribute it and/or modify
@@ -181,7 +180,7 @@ async def auth_middleware(request, handler):
             data = unflatten_data(request.query)
 
         if not is_auth and accept_key_in_post_data:
-            if ('key' in data and type(data['key']) == str and
+            if ('key' in data and type(data['key']) is str and
                     data['key'].startswith('pk_')):
                 is_auth = True
 
